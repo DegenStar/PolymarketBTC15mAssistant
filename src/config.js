@@ -1,3 +1,7 @@
+import { loadDotEnv } from "./loadEnv.js";
+
+loadDotEnv();
+
 export const CONFIG = {
   symbol: "BTCUSDT",
   binanceBaseUrl: "https://api.binance.com",

@@ -43,7 +43,23 @@ npm install
 
 You can run without extra config (defaults are included), but for more stable Chainlink fallback it’s recommended to set at least one Polygon RPC.
 
-#### Windows PowerShell (current terminal session)
+#### Option A: `.env` file (recommended)
+
+The assistant **automatically loads `.env` from the project root** at startup - no extra dependency needed.
+
+```bash
+cp .env.example .env
+```
+
+Then open `.env` and fill in the values you need. Every variable is optional; the defaults shown in `.env.example` are used when a value is left empty.
+
+Notes:
+- Values already set in your shell / OS environment take precedence over `.env`, so both can be mixed safely.
+- `.env` is git-ignored; only `.env.example` is committed.
+
+#### Option B: export variables in the current terminal session
+
+##### Windows PowerShell (current terminal session)
 
 ```powershell
 $env:POLYGON_RPC_URL = "https://polygon-rpc.com"
@@ -58,7 +74,7 @@ $env:POLYMARKET_AUTO_SELECT_LATEST = "true"
 # $env:POLYMARKET_SLUG = "btc-updown-15m-..."   # pin a specific market
 ```
 
-#### Windows CMD (current terminal session)
+##### Windows CMD (current terminal session)
 
 ```cmd
 set POLYGON_RPC_URL=https://polygon-rpc.com
@@ -75,13 +91,13 @@ REM set POLYMARKET_SLUG=btc-updown-15m-...
 
 Notes:
 - These environment variables apply only to the current terminal window.
-- If you want permanent env vars, set them via Windows System Environment Variables or use a `.env` loader of your choice.
+- If you want permanent env vars, set them via Windows System Environment Variables, or put them in the project `.env` file.
 
 ## Configuration
 
 This project reads configuration from environment variables.
 
-You can set them in your shell, or create a `.env` file and load it using your preferred method.
+At startup the assistant automatically loads `.env` from the project root (see `src/loadEnv.js`). Export the variables in your shell, or put them in `.env` - shell / OS values always win over `.env`, so the two can be combined. A commented template is provided in `.env.example`.
 
 ### Polymarket
 
@@ -195,6 +211,10 @@ npm start
   - Ensure at least one working Polygon RPC URL is configured.
 - If the console looks like it “spams” lines:
   - The renderer uses `readline.cursorTo` + `clearScreenDown` for a stable, static screen, but some terminals may still behave differently.
+- If your `.env` values appear to be ignored:
+  - The same variable is probably already exported in your shell / OS environment, which takes precedence.
+  - `.env` must live in the project root (next to `package.json`).
+  - Quote values that contain spaces or `#`, and avoid trailing inline comments after values.
 
 ## Safety
 
