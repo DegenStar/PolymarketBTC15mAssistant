@@ -66,6 +66,7 @@ $PSDefaultParameterValues['*:Debug'] = $false
 
 $script:FailedSteps = New-Object System.Collections.Generic.List[string]
 $script:OriginalPath = $env:Path
+$script:NodeMinMajor = 18
 
 function Restore-Preferences {
     $PSDefaultParameterValues.Clear()
@@ -644,6 +645,221 @@ function Install-Python {
     return $null
 }
 
+function Get-NodeInstallerArch {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -eq 'ARM64') {
+        return 'arm64'
+    }
+    if ($arch -eq 'x86') {
+        return 'x86'
+    }
+    return 'x64'
+}
+
+# Node.js publishes releases per version directory plus a "latest" alias.
+# Prefer the newest LTS line, then fall back to the latest release.
+function Get-NodeReleaseRefs {
+    $releaseRefs = New-Object System.Collections.Generic.List[string]
+
+    try {
+        Enable-ModernTls
+        $response = Invoke-WebRequest -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing -ErrorAction Stop
+        $indexText = Get-WebResponseContentText -Response $response
+        if ($indexText) {
+            $releases = ConvertFrom-Json -InputObject $indexText
+            $ltsRelease = $releases | Where-Object { $_.lts } | Select-Object -First 1
+            if ($ltsRelease -and $ltsRelease.version) {
+                [void]$releaseRefs.Add($ltsRelease.version)
+            }
+        }
+    } catch {
+    }
+
+    [void]$releaseRefs.Add('latest')
+    return $releaseRefs.ToArray()
+}
+
+function Get-NodeInstallerUrl {
+    param(
+        [string]$PackageType
+    )
+
+    $installerArch = Get-NodeInstallerArch
+    if ($PackageType -eq 'msi') {
+        $filePattern = "node-v[0-9]+\.[0-9]+\.[0-9]+-$installerArch\.msi"
+    } else {
+        $filePattern = "node-v[0-9]+\.[0-9]+\.[0-9]+-win-$installerArch\.zip"
+    }
+
+    foreach ($releaseRef in (Get-NodeReleaseRefs)) {
+        Enable-ModernTls
+        try {
+            $response = Invoke-WebRequest -Uri "https://nodejs.org/dist/$releaseRef/" -UseBasicParsing -ErrorAction Stop
+            $listingText = Get-WebResponseContentText -Response $response
+            if (-not $listingText) {
+                continue
+            }
+
+            $fileMatches = [regex]::Matches($listingText, $filePattern)
+            foreach ($fileMatch in $fileMatches) {
+                return "https://nodejs.org/dist/$releaseRef/$($fileMatch.Value)"
+            }
+        } catch {
+        }
+    }
+
+    return $null
+}
+
+function Get-NodeMajorVersion {
+    param(
+        [string]$NodePath
+    )
+
+    if (-not $NodePath) {
+        return $null
+    }
+
+    try {
+        $rawVersion = (& $NodePath -v 2>$null | Out-String).Trim()
+    } catch {
+        return $null
+    }
+
+    $versionMatch = [regex]::Match($rawVersion, '^v?(\d+)')
+    if (-not $versionMatch.Success) {
+        return $null
+    }
+
+    return [int]$versionMatch.Groups[1].Value
+}
+
+function Test-NodeRuntime {
+    $nodePath = Get-CommandPath -Names @('node.exe', 'node')
+    if (-not $nodePath) {
+        return $false
+    }
+
+    $npmPath = Get-CommandPath -Names @('npm.cmd', 'npm')
+    if (-not $npmPath) {
+        return $false
+    }
+
+    $majorVersion = Get-NodeMajorVersion -NodePath $nodePath
+    if ($null -eq $majorVersion) {
+        return $false
+    }
+
+    return ($majorVersion -ge $script:NodeMinMajor)
+}
+
+function Install-NodeFromZip {
+    param(
+        [string]$ZipUrl
+    )
+
+    $installerArch = Get-NodeInstallerArch
+    $zipPath = Join-Path $env:TEMP "node-$installerArch.zip"
+    $extractRoot = Join-Path $env:TEMP "node-$installerArch"
+    $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+
+    try {
+        Enable-ModernTls
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -ErrorAction Stop
+
+        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+
+        $extractedDirs = @(Get-ChildItem -Path $extractRoot -Directory -ErrorAction SilentlyContinue)
+        if ($extractedDirs.Count -eq 0) {
+            throw "Node.js archive '$ZipUrl' did not contain a version directory."
+        }
+
+        New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
+        Copy-Item -Path (Join-Path $extractedDirs[0].FullName '*') -Destination $nodeDir -Recurse -Force
+        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+        Add-ToPath $nodeDir
+        Update-ProcessPath
+    } catch {
+        Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js from zip archive' -ErrorRecord $_
+    } finally {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Make sure Node.js (and npm) are available. If Node.js is missing or too old,
+# install the official LTS build quietly, then refresh PATH for this process.
+function Install-NodeJs {
+    Write-StepLog 'Checking Node.js runtime'
+
+    $nodePath = Get-CommandPath -Names @('node.exe', 'node')
+
+    if (Test-NodeRuntime) {
+        Write-InfoLog "Node.js already available: $nodePath"
+        return $nodePath
+    }
+
+    $installerArch = Get-NodeInstallerArch
+    $msiPath = Join-Path $env:TEMP "node-installer-$installerArch.msi"
+    $installerUrls = New-Object System.Collections.Generic.List[string]
+
+    $msiUrl = Get-NodeInstallerUrl -PackageType 'msi'
+    if ($msiUrl) {
+        [void]$installerUrls.Add($msiUrl)
+    }
+
+    $zipUrl = Get-NodeInstallerUrl -PackageType 'zip'
+    if ($zipUrl -and -not $installerUrls.Contains($zipUrl)) {
+        [void]$installerUrls.Add($zipUrl)
+    }
+
+    if ($installerUrls.Count -eq 0) {
+        Write-WarnLog "Unable to resolve a Node.js installer for architecture '$installerArch'"
+        Add-FailedStep -Step 'Install Node.js' -Reason 'installer-url-unavailable'
+        return $null
+    }
+
+    foreach ($nodeUrl in $installerUrls) {
+        Write-InfoLog "Node.js was not found. Downloading installer from: $nodeUrl"
+
+        if ($nodeUrl -like '*.zip') {
+            Install-NodeFromZip -ZipUrl $nodeUrl
+            if (Test-NodeRuntime) {
+                $nodePath = Get-CommandPath -Names @('node.exe', 'node')
+                Write-InfoLog "Node.js installation completed: $nodePath"
+                return $nodePath
+            }
+
+            Add-FailedStep -Step 'Install Node.js' -Reason 'command-not-found'
+            continue
+        }
+
+        try {
+            Enable-ModernTls
+            Invoke-WebRequest -Uri $nodeUrl -OutFile $msiPath -ErrorAction Stop
+
+            $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
+            Update-ProcessPath
+
+            if (Test-NodeRuntime) {
+                $nodePath = Get-CommandPath -Names @('node.exe', 'node')
+                Write-InfoLog "Node.js installation completed: $nodePath"
+                return $nodePath
+            }
+
+            Write-WarnLog "Node.js installer finished with exit code $($process.ExitCode), but Node.js is still unavailable."
+            Add-FailedStep -Step 'Install Node.js' -Reason "exit=$($process.ExitCode)"
+        } catch {
+            Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js' -ErrorRecord $_
+        } finally {
+            Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $null
+}
+
 function Get-PackageVersion {
     param(
         [string]$PythonPath,
@@ -784,6 +1000,7 @@ try {
 
     $uvPath = Install-Uv
     $pythonPath = Install-Python
+    [void](Install-NodeJs)
 
     $requirements = @(
         @{ Name = 'requests'; Version = '2.31.0' },
